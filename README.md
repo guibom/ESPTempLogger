@@ -1,6 +1,8 @@
 ESPTempLogger
 =============
 
+![alt text](https://raw.githubusercontent.com/guibom/ESPTempLogger/master/pics/photo1.jpg "Photo")
+
 Basic ESP8266 + Attiny85 + DHT22 Temperature and Humidity logger.
 I've made this to experiment a bit with the ESP8266 wifi module, and hopefully make a remote sensor that posts the data to my server.
 
