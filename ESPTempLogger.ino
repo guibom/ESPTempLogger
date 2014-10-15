@@ -25,7 +25,7 @@
   #define DHT22_POWER_PIN 3
 #endif
 
-//WiFi information
+//WiFi AP information
 #define SSID "SSID"
 #define PASS "PASS"
 
@@ -43,6 +43,10 @@ uint8_t retry_attempt = 0;
   #define DEBUG_CONNECT(x)  Serial.begin(x)
   #define DEBUG_PRINT(x)    Serial.println(x)
   #define DEBUG_FLUSH()     Serial.flush()
+  //To catch when I forget to turn off debug on attiny85
+  #if defined(__AVR_ATtiny85__)
+    #error("No space for debug information on attiny85. Comment #define DEBUG line!");
+  #endif
 #else
   #define DEBUG_CONNECT(x)
   #define DEBUG_PRINT(x)
@@ -61,7 +65,7 @@ SoftwareSerial SoftSerial(SOFT_RX_PIN, SOFT_TX_PIN); // RX, TX
 
 void setup() {
 
-  //Callibration for internal oscillator from TinyTuner
+  //Callibration for internal oscillator from TinyTuner (will change for each MCU)
   #if defined(__AVR_ATtiny85__)  
     OSCCAL = 0xA9;
   #endif
