@@ -1,10 +1,12 @@
 // ESP8266 + Attiny85 + DHT22 Temperature Logger
+// version 0.2 - 2014/10/14
 // Copyright (c) 2014, Guilherme Ramos <longinus@gmail.com>
 // https://github.com/guibom/ESPTempLogger
 // Released under the MIT license. See LICENSE file for details.
 
 #include <avr/wdt.h>
 #include <avr/sleep.h>
+#include <avr/pgmspace.h>
 #include <stdlib.h>
 #include <SoftwareSerial.h>
 #include <DHT22.h>
@@ -30,38 +32,55 @@
 #define PASS "PASS"
 
 //Sensor id for MQTT message
-#define SENSOR_ID "1"  //Ideally something more clever should be used, like MAC address, etc
-
-//How many times to retry talking to module before giving up
-#define RETRY_COUNT   5
-uint8_t retry_attempt = 0;
+#define SENSOR_ID "ESP_DHT_1"  //Ideally something more clever should be used, like MAC address, etc
 
 //Comment to turn off Debug mode
-//#define DEBUG
+#define DEBUG
+
+//Remove debug if using attiny85
+#if defined(__AVR_ATtiny85__)
+  #undef DEBUG
+#endif
+
 
 #ifdef DEBUG
   #define DEBUG_CONNECT(x)  Serial.begin(x)
   #define DEBUG_PRINT(x)    Serial.println(x)
   #define DEBUG_FLUSH()     Serial.flush()
-  //To catch when I forget to turn off debug on attiny85
-  #if defined(__AVR_ATtiny85__)
-    #error("No space for debug information on attiny85. Comment #define DEBUG line!");
-  #endif
 #else
   #define DEBUG_CONNECT(x)
   #define DEBUG_PRINT(x)
   #define DEBUG_FLUSH()
 #endif
 
-//Disabling ADC saves ~230uAF. Needs to be re-enable for the internal voltage check
-#define adc_disable() (ADCSRA &= ~(1<<ADEN)) // disable ADC
-#define adc_enable()  (ADCSRA |=  (1<<ADEN)) // re-enable ADC
+//How many times to retry talking to module before giving up
+#define RETRY_COUNT   2
+uint8_t retry_attempt = 0;
+bool connected = false;   //TRUE when a connection is made with the target UDP server
+
+//PROGMEM answer strings from ESP
+char str_buffer[64];
+const char STR_OK[] PROGMEM =     "OK";
+const char STR_BOOT[] PROGMEM =   "ker.com]";  //End of bootup message
+const char STR_APNAME[] PROGMEM = "+CWJAP:\"";
+const char STR_SENDMODE[] PROGMEM = ">";
+
+//PROGMEM Payload for the UDP message
+char cmd[64];
+const char STR_PAYLOAD1[] PROGMEM = "{\"T\":\"home/sensor/%s/temperature\",\"P\":%hi.%01hi,\"R\":1}";
+const char STR_PAYLOAD2[] PROGMEM = "{\"T\":\"home/sensor/%s/humidity\",\"P\":%i.%01i,\"R\":1}";
+const char STR_PAYLOAD3[] PROGMEM = "{\"T\":\"home/sensor/%s/voltage\",\"P\":%d,\"R\":1}";
 
 // Setup a DHT22 instance
 DHT22 myDHT22(DHT22_PIN);
 
 //Software serial connected to ESP8266
 SoftwareSerial SoftSerial(SOFT_RX_PIN, SOFT_TX_PIN); // RX, TX
+
+//Disabling ADC saves ~230uAF. Needs to be re-enable for the internal voltage check
+#define adc_disable() (ADCSRA &= ~(1<<ADEN)) // disable ADC
+#define adc_enable()  (ADCSRA |=  (1<<ADEN)) // re-enable ADC
+
 
 void setup() {
 
@@ -70,33 +89,31 @@ void setup() {
     OSCCAL = 0xA9;
   #endif
 
+  //Disable ADC
+  adc_disable();  
+
   //Setup pins
   pinMode(DHT22_POWER_PIN, OUTPUT);
   pinMode(ESP_ENABLE_PIN, OUTPUT);
-
+  digitalWrite(DHT22_POWER_PIN, LOW);
   digitalWrite(ESP_ENABLE_PIN, LOW);
 
-  //Start with DHT22 power pin high to turn on the status LED
-  digitalWrite(DHT22_POWER_PIN, HIGH);
-
   //Debug serial print only works if DEBUG is defined
-  DEBUG_CONNECT(9600);
+  DEBUG_CONNECT(115200);
   DEBUG_PRINT(F("Arduino started"));
 
   //Make sure ESP8266 is set to 9600
   SoftSerial.begin(9600);
-
-  //Small delay on first powerup
-  delay(1000);
+  delay(100);
 }
 
-
 void loop(){
+  
   //Turn on ESP, get temperature and send to UDP server
   updateTemp();
-  
-  //Disable ADC
-  adc_disable();
+
+  //Set pins back to off state
+  cleanUp();
   
   DEBUG_PRINT(F("Going to sleep..."));
   DEBUG_FLUSH();
@@ -106,9 +123,6 @@ void loop(){
 
   //Start back here when woken from sleep
   DEBUG_PRINT(F("Woke up from sleep!"));
-
-  //Re-enable ADC 
-  adc_enable();
 }
 
 void updateTemp(){
@@ -123,34 +137,31 @@ void updateTemp(){
   //Try to enable ESP8266 Module. Return if can't
   if (!enableESP()) {
     DEBUG_PRINT(F("Can't talk to the module"));
-    disableESP();
-
-    //Powerdown DHT22
-    digitalWrite(DHT22_POWER_PIN, LOW);
-    DEBUG_PRINT(F("DHT22 Power OFF"));
-
     return;
   }
 
   //Set transmission mode
   SoftSerial.println(F("AT+CIPMODE=1"));
   SoftSerial.flush();
-  delay(500);
+  
+  if (!waitForString(getString(STR_OK), 2, 1000)) {
+    DEBUG_PRINT(F("Error setting CIPMODE"));    
+    return;
+  }
   
   //Connect to UDP server
   SoftSerial.println(F("AT+CIPSTART=\"UDP\",\"192.168.0.175\",6969"));
   SoftSerial.flush();
-  delay(1000);
 
   //Check for connection errors
-  if (!SoftSerial.find("OK")) {
+  if (!waitForString(getString(STR_OK), 2, 1000)) {
     DEBUG_PRINT(F("Error connecting to server"));
-    cleanUp(); //Close connection and clean up
     return;
   }
     
   //Connected fine to server
   DEBUG_PRINT(F("Connected to server!"));
+  connected = true;
 
   //Read DHT22 that will be sent
   errorCode = myDHT22.readData();
@@ -158,117 +169,46 @@ void updateTemp(){
   //If DHT22 is not returning valid data
   if (errorCode != DHT_ERROR_NONE) {    
     DEBUG_PRINT(F("Could not get DHT22 Sensor values. Error:"));
-    DEBUG_PRINT(errorCode);
-    cleanUp(); //Close connection and clean up
+    DEBUG_PRINT(errorCode);    
     return;
   }
   
   SoftSerial.println(F("AT+CIPSEND"));
   SoftSerial.flush();
-  delay(500);
-
-  if (SoftSerial.find(">")) {
+  
+  //We are in transmit mode
+  if (waitForString(getString(STR_SENDMODE), 1, 1000)) {
 
     DEBUG_PRINT(F("Ready to send..."));
 
-    //Create MQTT messages array
-    char cmd[64];
-    sprintf(cmd, "{\"T\":\"home/sensor/%s/temperature\",\"P\":%hi.%01hi,\"R\":1}", SENSOR_ID, myDHT22.getTemperatureCInt()/10, abs(myDHT22.getTemperatureCInt()%10));
+    //Create MQTT messages array  
+    sprintf(cmd, getString(STR_PAYLOAD1), SENSOR_ID, myDHT22.getTemperatureCInt()/10, abs(myDHT22.getTemperatureCInt()%10));
 
     SoftSerial.println(cmd);
     SoftSerial.flush();
     DEBUG_PRINT(cmd);
     delay(250);
 
-    sprintf(cmd, "{\"T\":\"home/sensor/%s/humidity\",\"P\":%i.%01i,\"R\":1}", SENSOR_ID, myDHT22.getHumidityInt()/10, myDHT22.getHumidityInt()%10);
+    sprintf(cmd, getString(STR_PAYLOAD2), SENSOR_ID, myDHT22.getHumidityInt()/10, myDHT22.getHumidityInt()%10);
 
     SoftSerial.println(cmd);
     SoftSerial.flush();
     DEBUG_PRINT(cmd);
     delay(250);
 
-    sprintf(cmd, "{\"T\":\"home/sensor/%s/battery\",\"P\":%d,\"R\":1}", SENSOR_ID, readVcc());
-
-    SoftSerial.println(cmd);
-    SoftSerial.flush();
-    DEBUG_PRINT(cmd);
-    delay(500);
+    sprintf(cmd, getString(STR_PAYLOAD3), SENSOR_ID, readVcc());
     
-    DEBUG_PRINT(F("All messages sent!"));      
-    cleanUp(); //Close connection and clean up
-
+    SoftSerial.println(cmd);
+    SoftSerial.flush();
+    DEBUG_PRINT(cmd);
+    delay(250);
+    
+    DEBUG_PRINT(F("All messages sent!"));
     return;
   }    
   
   DEBUG_PRINT(F("Error waiting for input or sending"));
-  cleanUp(); //Close connection and clean up
   return;
-}
-
-//Only connect to AP if it's not already connected.
-//It should always reconnect automatically.
-boolean connectWiFi() {
-
-  //Check if already connected
-  SoftSerial.println(F("AT+CWJAP?"));
-  SoftSerial.flush();
-  delay(100);
-    
-  if (SoftSerial.find("+CWJAP:\"")) {  
-    #ifdef DEBUG
-      char buf[12];
-      SoftSerial.readBytesUntil(0x22, buf, sizeof(buf));
-      DEBUG_PRINT(F("Connected to AP:"));
-      DEBUG_PRINT(buf);
-    #endif
-
-    return true;
-  }
-
-  //If not connected, connect now
-  DEBUG_PRINT(F("Not connected to AP yet"));
-
-  SoftSerial.println("AT+CWMODE=1");
-  DEBUG_PRINT(F("STA Mode set"));
-  delay(500);
-  
-  //Create connection string
-  char cmd[48];
-  sprintf(cmd, "AT+CWJAP=\"%s\",\"%s\"", SSID, PASS);
-  SoftSerial.println(cmd);
-  SoftSerial.flush();
-  DEBUG_PRINT(cmd);
-  delay(10000);
-
-  if(SoftSerial.find("OK")){
-    return true;
-  }else{
-    return false;
-  }
-}
-
-void cleanUp() {
-  SoftSerial.println(F("AT+CIPCLOSE"));
-  SoftSerial.flush();
-  DEBUG_PRINT(F("Closed connection"));
-
-  //Clear 64byte receive buffer
-  clearBuffer();
-  DEBUG_PRINT(F("Buffer Empty"));
-
-  //Powerdown DHT22
-  digitalWrite(DHT22_POWER_PIN, LOW);
-  DEBUG_PRINT(F("DHT22 Power OFF"));
-
-  //Bring chip enable pin low
-  disableESP();
-}
-
-//Remove all bytes from the buffer
-void clearBuffer() {
-
-  while (SoftSerial.available())
-    SoftSerial.read();
 }
 
 //Bring Enable pin up, wait for module to wake-up/connect and turn off echo.
@@ -278,16 +218,18 @@ bool enableESP() {
   digitalWrite(ESP_ENABLE_PIN, HIGH);
   DEBUG_PRINT(F("ESP8266 Enabled. Waiting to spin up..."));
 
-  //Wait for module to boot up and connect to AP
-  delay(6000);  
+  //Wait for module to boot up and connect to AP  
+  waitForString(getString(STR_BOOT), 8, 2000);  //End of bootup message
   clearBuffer(); //Clear local buffer
+
+  //Needs some time to connect to AP
+  delay(4000);
 
   //Local echo off
   SoftSerial.println(F("ATE0"));
   SoftSerial.flush();
-  delay(1000);
-
-  if (SoftSerial.find("OK")) {
+  
+  if (waitForString(getString(STR_OK), 2, 1000)) {  
     DEBUG_PRINT(F("Local echo OFF"));
     DEBUG_PRINT(F("ESP8266 UART link okay"));
 
@@ -299,10 +241,9 @@ bool enableESP() {
   DEBUG_PRINT(F("Error initializing the module"));
   
   //Try again until retry counts expire
-  if (retry_attempt <= RETRY_COUNT) {
-    delay(2000);
+  if (retry_attempt < RETRY_COUNT) {
     retry_attempt++;
-    return enableESP();
+    return enableESP();    
   } else {
     retry_attempt = 0;
     return false;
@@ -315,9 +256,113 @@ bool disableESP() {
   //Disable ESP8266 Module
   digitalWrite(ESP_ENABLE_PIN, LOW);
   DEBUG_PRINT(F("ESP8266 Disabled"));
-  delay(100);
-
+  
   return true;
+}
+
+//Only connect to AP if it's not already connected.
+//It should always reconnect automatically.
+boolean connectWiFi() {
+
+  //Check if already connected
+  SoftSerial.println(F("AT+CWJAP?"));
+  SoftSerial.flush();
+  
+  //Check if connected to AP
+  if (waitForString(getString(STR_APNAME), 8, 500)) {
+   
+    DEBUG_PRINT(F("Connected to AP"));
+    return true;
+  }
+
+  //Not connected, connect now
+  DEBUG_PRINT(F("Not connected to AP yet"));
+
+  SoftSerial.println("AT+CWMODE=1");
+  DEBUG_PRINT(F("STA Mode set"));
+  waitForString(getString(STR_OK), 2, 500);
+  
+  //Create connection string
+  sprintf(cmd, "AT+CWJAP=\"%s\",\"%s\"", SSID, PASS);
+  SoftSerial.println(cmd);
+  SoftSerial.flush();
+  DEBUG_PRINT(cmd);
+
+  if(waitForString(getString(STR_OK), 2, 10000)) {  
+    return true;
+  }else{
+    return false;
+  }
+}
+
+//Wait for specific input string until timeout runs out
+bool waitForString(char* input, uint8_t length, unsigned int timeout) {
+
+  unsigned long end_time = millis() + timeout;
+  int current_byte = 0;
+  uint8_t index = 0;
+
+  while (end_time >= millis()) {
+    
+      if(SoftSerial.available()) {
+        
+        //Read one byte from serial port
+        current_byte = SoftSerial.read();
+
+        if (current_byte != -1) {
+          //Search one character at a time
+          if (current_byte == input[index]) {
+            index++;
+            
+            //Found the string
+            if (index == length) {              
+              return true;
+            }
+          //Restart position of character to look for
+          } else {
+            index = 0;
+          }
+        }
+      }
+  }  
+  //Timed out
+  return false;
+}
+
+void cleanUp() {
+
+  //Close connection if needed
+  if (connected) {
+    SoftSerial.println(F("AT+CIPCLOSE"));
+    SoftSerial.flush();
+    DEBUG_PRINT(F("Closed connection"));  
+  }
+
+  connected = false;
+  
+  //Clear 64byte receive buffer
+  clearBuffer();
+  DEBUG_PRINT(F("Buffer Empty"));
+
+  //Powerdown DHT22
+  digitalWrite(DHT22_POWER_PIN, LOW);
+  DEBUG_PRINT(F("DHT22 Power OFF"));
+
+  //Bring chip enable pin low
+  disableESP();  
+}
+
+//Remove all bytes from the buffer
+void clearBuffer() {
+
+  while (SoftSerial.available())
+    SoftSerial.read();
+}
+
+//Return char string from PROGMEN
+char* getString(const char* str) {
+  strcpy_P(str_buffer, (char*)str);
+  return str_buffer;
 }
 
 //-----------------------------------------------------------------------------
@@ -383,6 +428,10 @@ void powerdownDelay(unsigned long milliseconds) {
 int readVcc() {
   // Read 1.1V reference against AVcc
   // set the reference to Vcc and the measurement to the internal 1.1V reference
+
+  //Re-enable ADC 
+  adc_enable();
+
 #if defined(__AVR_ATmega32U4__) || defined(__AVR_ATmega1280__) || defined(__AVR_ATmega2560__)
   ADMUX = _BV(REFS0) | _BV(MUX4) | _BV(MUX3) | _BV(MUX2) | _BV(MUX1);
 #elif defined (__AVR_ATtiny24__) || defined(__AVR_ATtiny44__) || defined(__AVR_ATtiny84__)
@@ -404,5 +453,9 @@ int readVcc() {
 
   //result = 1126400L / result; // Calculate Vcc (in mV);
   result = 1074835L / result;
+  
+  //Disable ADC
+  adc_disable();
+
   return (int)result; // Vcc in millivolts
 }
