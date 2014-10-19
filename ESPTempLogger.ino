@@ -1,5 +1,5 @@
 // ESP8266 + Attiny85 + DHT22 Temperature Logger
-// version 0.2 - 2014/10/14
+// version 0.22 - 2014/10/14
 // Copyright (c) 2014, Guilherme Ramos <longinus@gmail.com>
 // https://github.com/guibom/ESPTempLogger
 // Released under the MIT license. See LICENSE file for details.
@@ -67,9 +67,7 @@ const char STR_SENDMODE[] PROGMEM = ">";
 
 //PROGMEM Payload for the UDP message
 char cmd[64];
-const char STR_PAYLOAD1[] PROGMEM = "{\"T\":\"home/sensor/%s/temperature\",\"P\":%hi.%01hi,\"R\":1}";
-const char STR_PAYLOAD2[] PROGMEM = "{\"T\":\"home/sensor/%s/humidity\",\"P\":%i.%01i,\"R\":1}";
-const char STR_PAYLOAD3[] PROGMEM = "{\"T\":\"home/sensor/%s/voltage\",\"P\":%d,\"R\":1}";
+const char STR_PAYLOAD[] PROGMEM = "{\"T\":\"sensor/raw/ESP-DHT\",\"P\":[\"%s\",%hi.%01hi,%i.%01i,%d]}";
 
 // Setup a DHT22 instance
 DHT22 myDHT22(DHT22_PIN);
@@ -80,6 +78,7 @@ SoftwareSerial SoftSerial(SOFT_RX_PIN, SOFT_TX_PIN); // RX, TX
 //Disabling ADC saves ~230uAF. Needs to be re-enable for the internal voltage check
 #define adc_disable() (ADCSRA &= ~(1<<ADEN)) // disable ADC
 #define adc_enable()  (ADCSRA |=  (1<<ADEN)) // re-enable ADC
+
 
 
 void setup() {
@@ -182,21 +181,7 @@ void updateTemp(){
     DEBUG_PRINT(F("Ready to send..."));
 
     //Create MQTT messages array  
-    sprintf(cmd, getString(STR_PAYLOAD1), SENSOR_ID, myDHT22.getTemperatureCInt()/10, abs(myDHT22.getTemperatureCInt()%10));
-
-    SoftSerial.println(cmd);
-    SoftSerial.flush();
-    DEBUG_PRINT(cmd);
-    delay(250);
-
-    sprintf(cmd, getString(STR_PAYLOAD2), SENSOR_ID, myDHT22.getHumidityInt()/10, myDHT22.getHumidityInt()%10);
-
-    SoftSerial.println(cmd);
-    SoftSerial.flush();
-    DEBUG_PRINT(cmd);
-    delay(250);
-
-    sprintf(cmd, getString(STR_PAYLOAD3), SENSOR_ID, readVcc());
+    sprintf(cmd, getString(STR_PAYLOAD), SENSOR_ID, myDHT22.getTemperatureCInt()/10, abs(myDHT22.getTemperatureCInt()%10), myDHT22.getHumidityInt()/10, myDHT22.getHumidityInt()%10, readVcc());
     
     SoftSerial.println(cmd);
     SoftSerial.flush();
